@@ -1,0 +1,253 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Enums\UserRole;
+use App\Handlers\TransaksiHandler;
+use App\Helpers\DirectThermalPrinterHelper;
+use App\Helpers\PaginateHelper;
+use App\Helpers\PaymentGatewayHelper;
+use App\Http\Requests\CheckoutRequest;
+use App\Http\Requests\ConfirmPaymentRequest;
+use App\Interfaces\KategoriInterface;
+use App\Interfaces\PelangganInterface;
+use App\Interfaces\ProdukInterface;
+use App\Interfaces\TransaksiInterface;
+use App\Models\Pelanggan;
+use App\Models\Produk;
+use App\Models\Transaksi;
+use App\Models\User;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Inertia\Inertia;
+use Inertia\Response;
+use Throwable;
+
+class TransaksiController extends Controller
+{
+    public function __construct(
+        private TransaksiInterface $transaksiInterface,
+        private PelangganInterface $pelangganInterface,
+        private ProdukInterface $produkInterface,
+        private KategoriInterface $kategoriInterface,
+        private TransaksiHandler $transaksiHandler
+    ) {}
+
+    public function index(Request $request): Response
+    {
+        $user = $request->user();
+        $filters = $request->only([
+            'search',
+            'tanggal',
+            'date_from',
+            'date_to',
+            'id_pelanggan',
+            'id_user',
+            'status',
+            'sort_by',
+            'sort_direction',
+            'per_page',
+        ]);
+
+        $isKasir = $user?->role === UserRole::Kasir;
+        if ($isKasir) {
+            if (($filters['status'] ?? '') === 'pending') {
+                unset($filters['id_user']);
+            } else {
+                $filters['kasir_or_pending_id'] = $user->id_user;
+                unset($filters['id_user']);
+            }
+        }
+
+        $transaksi = $this->transaksiInterface->getAll($filters);
+        $kasirList = $isKasir
+            ? collect([['id_user' => $user->id_user, 'nama_lengkap' => $user->nama_lengkap, 'username' => $user->username]])
+            : User::where('role', UserRole::Kasir->value)
+                ->orderBy('nama_lengkap')
+                ->get(['id_user', 'nama_lengkap', 'username']);
+
+        return Inertia::render('Transaksi/Index', [
+            'transaksi' => $transaksi,
+            'pagination' => PaginateHelper::getPaginate($transaksi),
+            'kasirList' => $kasirList,
+            'isKasirScoped' => $isKasir,
+            'filters' => $filters,
+        ]);
+    }
+
+    public function pos(): Response
+    {
+        $prefix = 'TRX-'.now()->format('Ym').'-';
+        $last = Transaksi::where('kode_transaksi', 'like', $prefix.'%')
+            ->orderByDesc('id_transaksi')
+            ->value('kode_transaksi');
+        $nextNumber = $last ? ((int) substr((string) $last, -4) + 1) : 1;
+        $nextKode = $prefix.str_pad((string) $nextNumber, 4, '0', STR_PAD_LEFT);
+
+        // Pastikan Pelanggan Umum (Non-Member) selalu tersedia untuk pembeli walk-in
+        $walkIn = Pelanggan::firstOrCreate(
+            ['nama_pelanggan' => 'Pelanggan Umum (Non-Member)'],
+            ['kota' => 'Umum', 'no_telepon' => '-']
+        );
+
+        $pelangganList = Pelanggan::query()
+            ->orderByRaw('CASE WHEN id_pelanggan = ? THEN 0 ELSE 1 END', [$walkIn->id_pelanggan])
+            ->orderBy('nama_pelanggan')
+            ->get();
+
+        return Inertia::render('Pos/Index', [
+            'nextKodeTransaksi' => $nextKode,
+            'pelangganList' => $pelangganList,
+            'produkList' => Produk::with('kategori')->orderBy('nama_produk')->get(),
+            'kategoriList' => $this->kategoriInterface->getAllWithoutPagination(),
+            'gatewayConfig' => PaymentGatewayHelper::getGatewayConfigInfo(),
+        ]);
+    }
+
+    public function create(): Response
+    {
+        return $this->pos();
+    }
+
+    public function show(int $id): Response
+    {
+        $transaksi = $this->transaksiInterface->find($id);
+
+        if ($transaksi->status !== 'selesai') {
+            abort(403, 'Transaksi belum dibayar lunas atau sudah dibatalkan, sehingga struk belum dapat dicetak.');
+        }
+
+        return Inertia::render('Transaksi/Show', [
+            'transaksi' => $transaksi,
+        ]);
+    }
+
+    /**
+     * Konfirmasi pelunasan pesanan Member yang berstatus 'pending' oleh Kasir / Admin.
+     */
+    public function confirmPayment(ConfirmPaymentRequest $request, int $id): RedirectResponse|JsonResponse
+    {
+        try {
+            $transaksi = $this->transaksiHandler->konfirmasiPembayaran($id, $request->validated());
+
+            if ($request->wantsJson()) {
+                return response()->json([
+                    'message' => "Pembayaran transaksi {$transaksi->kode_transaksi} berhasil dikonfirmasi LUNAS. Struk siap dicetak.",
+                    'data' => $transaksi,
+                ]);
+            }
+
+            return redirect()->back()
+                ->with('success', "Pembayaran transaksi {$transaksi->kode_transaksi} berhasil dikonfirmasi LUNAS. Struk kini dapat dicetak.");
+        } catch (Throwable $e) {
+            if ($request->wantsJson()) {
+                return response()->json([
+                    'message' => $e->getMessage(),
+                ], 422);
+            }
+
+            return redirect()->back()
+                ->withErrors(['transaksi' => 'Gagal konfirmasi pembayaran: '.$e->getMessage()]);
+        }
+    }
+
+    public function store(CheckoutRequest $request): RedirectResponse|JsonResponse
+    {
+        try {
+            $transaksi = $this->transaksiHandler->prosesCheckout($request->validated());
+
+            if ($request->wantsJson()) {
+                return response()->json([
+                    'message' => "Transaksi {$transaksi->kode_transaksi} berhasil diproses.",
+                    'data' => $transaksi,
+                ], 201);
+            }
+
+            return redirect()->route('transaksi.index')
+                ->with('success', "Transaksi {$transaksi->kode_transaksi} berhasil diproses.")
+                ->with('receipt', $transaksi);
+        } catch (Throwable $e) {
+            if ($request->wantsJson()) {
+                return response()->json([
+                    'message' => $e->getMessage(),
+                ], 422);
+            }
+
+            return redirect()->back()
+                ->withErrors(['checkout' => 'Gagal memproses transaksi: '.$e->getMessage()]);
+        }
+    }
+
+    public function void(int $id): RedirectResponse
+    {
+        try {
+            $transaksi = $this->transaksiHandler->voidTransaksi($id);
+
+            return redirect()->back()
+                ->with('success', "Transaksi {$transaksi->kode_transaksi} berhasil dibatalkan (void) dan stok telah dikembalikan.");
+        } catch (Throwable $e) {
+            return redirect()->back()
+                ->withErrors(['transaksi' => 'Gagal membatalkan transaksi: '.$e->getMessage()]);
+        }
+    }
+
+    /**
+     * Cetak struk langsung (1-Click Silent Direct Print) ke printer thermal EPSON TM-T82X Receipt tanpa dialog browser.
+     */
+    public function printDirect(Request $request, int $id): JsonResponse
+    {
+        try {
+            $transaksi = $this->transaksiInterface->find($id);
+
+            if ($transaksi->status !== 'selesai') {
+                return response()->json([
+                    'ok' => false,
+                    'message' => 'Transaksi belum dibayar lunas (status: '.strtoupper((string) $transaksi->status).'). Struk tidak dapat dicetak sebelum pembayaran lunas.',
+                ], 422);
+            }
+
+            $tunai = (float) ($request->input('tunai') ?? $transaksi->total_belanja);
+            $kembalian = (float) ($request->input('kembalian') ?? max(0, $tunai - $transaksi->total_belanja));
+            $paperSize = (string) ($request->input('paper_size') ?? '80mm');
+            $cols = $request->input('cols') ? (int) $request->input('cols') : null;
+            $leftSpace = $request->input('left_space') !== null ? (int) $request->input('left_space') : 0;
+
+            $printerName = DirectThermalPrinterHelper::printTransaksi(
+                $transaksi,
+                $tunai,
+                $kembalian,
+                $paperSize,
+                $cols,
+                $leftSpace
+            );
+
+            return response()->json([
+                'ok' => true,
+                'message' => "Struk {$transaksi->kode_transaksi} berhasil dicetak langsung ke {$printerName}.",
+                'printer' => $printerName,
+            ]);
+        } catch (Throwable $e) {
+            return response()->json([
+                'ok' => false,
+                'message' => 'Gagal cetak langsung: '.$e->getMessage(),
+            ], 422);
+        }
+    }
+
+    /**
+     * Endpoint untuk membuat QRIS Dinamis via Xendit API (atau EMVCo QRIS Standar Bank Indonesia).
+     */
+    public function createQris(Request $request): JsonResponse
+    {
+        $kodeTransaksi = (string) ($request->input('kode_transaksi') ?: ('TRX-'.now()->format('Ym').'-0001'));
+        $amount = max(1000.0, (float) ($request->input('amount') ?: 0));
+
+        $qrisData = PaymentGatewayHelper::createDynamicQris($kodeTransaksi, $amount);
+
+        return response()->json([
+            'ok' => true,
+            'data' => $qrisData,
+        ]);
+    }
+}

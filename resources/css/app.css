@@ -1,0 +1,170 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+    --bg-page: #F1F5F9;
+    --bg-surface: #FFFFFF;
+    --bg-subtle: #F8FAFC;
+    --border-default: #CBD5E1;
+    --border-light: #E2E8F0;
+    --text-primary: #0F172A;
+    --text-secondary: #475569;
+    --accent-primary: #1E3A5F;
+    --accent-hover: #162C49;
+    --danger-text: #B91C1C;
+
+    --toko-primary: #1E3A5F;
+    --toko-primary-dark: #162C49;
+    --toko-keycap: #F8FAFC;
+    --toko-led-text: #FFFFFF;
+    --toko-workspace-bg: #F1F5F9;
+    --toko-panel-bg: #FFFFFF;
+    --toko-thead-bg: #F8FAFC;
+    --toko-input-scan-bg: #FFFFFF;
+    --toko-input-scan-text: #0F172A;
+    --toko-text-main: #0F172A;
+    --toko-text-muted: #475569;
+    --toko-border: #CBD5E1;
+    --toko-row-highlight: #F1F5F9;
+    --toko-price-text: #0F172A;
+}
+
+.toko-workspace {
+    background-color: var(--toko-workspace-bg) !important;
+    color: var(--toko-text-main) !important;
+}
+
+.toko-panel {
+    background-color: var(--toko-panel-bg) !important;
+    color: var(--toko-text-main) !important;
+    border: 1px solid var(--toko-border) !important;
+    border-radius: 0.375rem;
+}
+
+.toko-thead {
+    background-color: var(--toko-thead-bg) !important;
+    color: var(--toko-text-muted) !important;
+    border-color: var(--toko-border) !important;
+}
+
+.toko-input-scan {
+    background-color: var(--toko-input-scan-bg) !important;
+    color: var(--toko-input-scan-text) !important;
+    border: 1px solid var(--toko-border) !important;
+    border-radius: 0.375rem !important;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease !important;
+}
+
+.toko-input-scan:focus {
+    border-color: var(--toko-primary) !important;
+    box-shadow: 0 0 0 2px rgba(30, 58, 95, 0.18) !important;
+    outline: none !important;
+}
+
+/* Normalisasi border tebal menjadi border halus 1px sesuai panduan-desain-ui-pos-tokoku.md */
+.toko-workspace .border-2,
+.toko-workspace .border-black,
+.toko-workspace .border-\[\#111111\] {
+    border-width: 1px !important;
+    border-color: var(--toko-border) !important;
+}
+
+.toko-row-active {
+    background-color: var(--toko-row-highlight) !important;
+    color: var(--toko-text-main) !important;
+    font-weight: 600 !important;
+}
+
+.toko-price {
+    color: var(--toko-text-main) !important;
+}
+
+.toko-btn-pay {
+    background-color: #1E3A5F !important;
+    color: #ffffff !important;
+    border: 1px solid #162C49 !important;
+}
+
+.toko-btn-pay:hover:not(:disabled) {
+    background-color: #162C49 !important;
+}
+
+.toko-banner-success {
+    background-color: #f0fdf4 !important;
+    color: #166534 !important;
+    border: 1px solid #bbf7d0 !important;
+}
+
+.toko-banner-error {
+    background-color: #fef2f2 !important;
+    color: #B91C1C !important;
+    border: 1px solid #fecaca !important;
+}
+
+.toko-banner-info {
+    background-color: #F8FAFC !important;
+    color: #334155 !important;
+    border: 1px solid #CBD5E1 !important;
+}
+
+.toko-receipt-paper {
+    background-color: #fffef8 !important;
+    color: #0f172a !important;
+}
+
+.dark .toko-workspace .bg-slate-900 {
+    background-color: #162033 !important;
+}
+
+.dark .toko-workspace .bg-slate-950 {
+    background-color: #0b1220 !important;
+}
+
+.dark .toko-workspace .bg-slate-800 {
+    background-color: #1e293b !important;
+}
+
+@media print {
+    @page {
+        size: 80mm auto;
+        margin: 0mm !important;
+    }
+
+    html,
+    body {
+        width: 80mm !important;
+        height: auto !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        background: #ffffff !important;
+        overflow: visible !important;
+    }
+
+    body * {
+        visibility: hidden !important;
+    }
+
+    #printable-receipt,
+    #printable-receipt * {
+        visibility: visible !important;
+    }
+
+    #printable-receipt {
+        position: absolute !important;
+        left: 0 !important;
+        top: 0 !important;
+        width: 80mm !important;
+        max-width: 80mm !important;
+        margin: 0 !important;
+        padding: 3mm 4mm !important;
+        background: #ffffff !important;
+        color: #111111 !important;
+        border: none !important;
+        box-shadow: none !important;
+    }
+
+    .no-print {
+        display: none !important;
+    }
+}
