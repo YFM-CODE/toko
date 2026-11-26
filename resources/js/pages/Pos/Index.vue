@@ -37,9 +37,9 @@ const props = defineProps({
     gatewayConfig: {
         type: Object,
         default: () => ({
-            xendit_configured: false,
-            mode_label: 'SIMULASI LOKAL (SIAP XENDIT)',
-            settlement_destination: 'BANK BRI • 0071-01-002345-30-8 a.n TOKO RITEL MANDIRI',
+            duitku_configured: false,
+            mode_label: 'DUITKU SANDBOX',
+            settlement_destination: 'DUITKU SANDBOX • YAZID, ELEKTRONIK',
         }),
     },
 });

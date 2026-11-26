@@ -37,43 +37,44 @@ class PaymentGatewayHelper
     ];
 
     /**
-     * Informasi konfigurasi Payment Gateway & Tujuan Dana Toko.
+     * Informasi konfigurasi Payment Gateway Duitku (Sandbox / Production) & Tujuan Dana Toko.
      *
      * @return array{
-     *     xendit_configured: bool,
+     *     duitku_configured: bool,
+     *     sandbox: bool,
+     *     merchant_code: string,
+     *     merchant_name: string,
+     *     merchant_nmid: string,
+     *     qris_image_url: string,
      *     mode_label: string,
      *     settlement_destination: string
      * }
      */
     public static function getGatewayConfigInfo(): array
     {
-        $keyName = trim((string) env('XENDIT_KEY_NAME', 'coba_payment'));
-        $publicKey = trim((string) env('XENDIT_PUBLIC_KEY', ''));
-        $secretKey = trim((string) env('XENDIT_SECRET_KEY', ''));
-        $activeKey = $secretKey !== '' ? $secretKey : $publicKey;
+        $merchantCode = trim((string) config('services.duitku.merchant_code', env('DUITKU_MERCHANT_CODE', '')));
+        $apiKey = trim((string) config('services.duitku.api_key', env('DUITKU_API_KEY', '')));
+        $isSandbox = (bool) config('services.duitku.sandbox', filter_var(env('DUITKU_SANDBOX', true), FILTER_VALIDATE_BOOLEAN));
 
-        $isXendit = $activeKey !== '';
-        $isLive = str_starts_with($activeKey, 'xnd_production_') || str_starts_with($activeKey, 'xnd_public_production_');
+        $isConfigured = $merchantCode !== '' && $apiKey !== '';
 
         $merchantName = trim((string) env('TOKO_MERCHANT_NAME', 'YAZID, ELEKTRONIK'));
         $merchantNmid = trim((string) env('TOKO_MERCHANT_NMID', 'ID1026647000219'));
         $qrisImage = trim((string) env('TOKO_QRIS_IMAGE', '/images/qris-toko.jpg'));
-        $settlementBank = trim((string) env('TOKO_SETTLEMENT_ACCOUNT', "GOPAY MERCHANT • {$merchantName} (NMID: {$merchantNmid})"));
+        $settlementBank = trim((string) env('TOKO_SETTLEMENT_ACCOUNT', "DUITKU ({$merchantCode}) • {$merchantName}"));
 
-        if ($secretKey !== '') {
-            $modeLabel = $isLive ? "XENDIT LIVE ({$keyName})" : "XENDIT TEST ({$keyName})";
+        if ($isConfigured) {
+            $modeLabel = $isSandbox ? "DUITKU SANDBOX ({$merchantCode})" : "DUITKU PRODUCTION ({$merchantCode})";
         } elseif ($qrisImage !== '') {
             $modeLabel = "QRIS MERCHANT RESMI ({$merchantName})";
-        } elseif ($isXendit) {
-            $modeLabel = "XENDIT DEVELOPMENT ({$keyName})";
         } else {
             $modeLabel = 'SIMULASI LOKAL';
         }
 
         return [
-            'xendit_configured' => $isXendit,
-            'key_name' => $keyName,
-            'has_secret_key' => $secretKey !== '',
+            'duitku_configured' => $isConfigured,
+            'sandbox' => $isSandbox,
+            'merchant_code' => $merchantCode,
             'merchant_name' => $merchantName,
             'merchant_nmid' => $merchantNmid,
             'qris_image_url' => $qrisImage,
@@ -83,57 +84,88 @@ class PaymentGatewayHelper
     }
 
     /**
-     * Membuat QRIS Dinamis via Xendit API (`POST https://api.xendit.co/qr_codes`) jika `XENDIT_SECRET_KEY` diisi di `.env`.
-     * Jika belum diisi, otomatis membuat payload QRIS Standar EMVCo Bank Indonesia untuk rekening toko.
+     * Membuat Invoice / QRIS Dinamis via Duitku V2 Inquiry API
+     * (Sandbox: https://sandbox.duitku.com/webapi/api/merchant/v2/inquiry | Production: https://passport.duitku.com/webapi/api/merchant/v2/inquiry).
      *
-     * @return array{
-     *     qr_id: string,
-     *     qr_string: string,
-     *     reference_id: string,
-     *     amount: float,
-     *     provider: string,
-     *     is_xendit_live: bool,
-     *     settlement_destination: string
-     * }
+     * @return array<string, mixed>
      */
-    public static function createDynamicQris(string $kodeTransaksi, float $amount): array
-    {
+    public static function createDynamicQris(
+        string $kodeTransaksi,
+        float $amount,
+        string $paymentMethod = '',
+        ?string $customerEmail = null,
+        ?string $customerName = null
+    ): array {
         $config = self::getGatewayConfigInfo();
-        $secretKey = trim((string) env('XENDIT_SECRET_KEY', ''));
-        $publicKey = trim((string) env('XENDIT_PUBLIC_KEY', ''));
-        $apiKey = $secretKey !== '' ? $secretKey : $publicKey;
-        $referenceId = $kodeTransaksi.'-'.now()->format('His');
+        $merchantCode = $config['merchant_code'];
+        $apiKey = trim((string) config('services.duitku.api_key', env('DUITKU_API_KEY', '')));
+        $isSandbox = $config['sandbox'];
+        $method = trim($paymentMethod) !== '' ? strtoupper(trim($paymentMethod)) : (string) config('services.duitku.default_method', 'BR');
 
-        if ($apiKey !== '') {
+        // Gunakan 100% nominal tagihan asli tanpa pernah menaikkan harga belanja pembeli
+        $paymentAmount = max(1, (int) round($amount));
+        $merchantOrderId = $kodeTransaksi.'-'.now()->format('His');
+        $gatewayError = null;
+
+        if ($merchantCode !== '' && $apiKey !== '') {
+            $baseUrl = $isSandbox
+                ? 'https://sandbox.duitku.com/webapi/api/merchant'
+                : 'https://passport.duitku.com/webapi/api/merchant';
+
+            $signature = md5($merchantCode.$merchantOrderId.$paymentAmount.$apiKey);
+
             try {
-                $response = Http::withBasicAuth($apiKey, '')
-                    ->withHeaders([
-                        'api-version' => '2022-07-31',
-                        'Content-Type' => 'application/json',
-                    ])
-                    ->timeout(10)
-                    ->post('https://api.xendit.co/qr_codes', [
-                        'reference_id' => $referenceId,
-                        'type' => 'DYNAMIC',
-                        'currency' => 'IDR',
-                        'amount' => (int) round($amount),
-                    ]);
+                $http = Http::withHeaders([
+                    'Content-Type' => 'application/json',
+                ])->timeout(12);
 
-                if ($response->successful()) {
-                    $json = $response->json();
+                if ($isSandbox && app()->isLocal()) {
+                    $http = $http->withoutVerifying();
+                }
 
+                $response = $http->post("{$baseUrl}/v2/inquiry", [
+                    'merchantCode' => $merchantCode,
+                    'paymentAmount' => $paymentAmount,
+                    'paymentMethod' => $method,
+                    'merchantOrderId' => $merchantOrderId,
+                    'productDetails' => "Pembayaran Transaksi {$kodeTransaksi} - {$config['merchant_name']}",
+                    'customerVaName' => $customerName ?: 'Pelanggan Toko',
+                    'email' => $customerEmail ?: 'pelanggan@tokoku.local',
+                    'callbackUrl' => url('/api/payment/duitku/callback'),
+                    'returnUrl' => url('/member/dashboard?tab=riwayat'),
+                    'expiryPeriod' => 60,
+                    'signature' => $signature,
+                ]);
+
+                $json = $response->json() ?? [];
+                if ($response->successful() && ($json['statusCode'] ?? '') === '00') {
                     return [
-                        'qr_id' => (string) ($json['id'] ?? ('qr_'.$referenceId)),
-                        'qr_string' => (string) ($json['qr_string'] ?? '00020101021226580014ID.CO.BRI.WWW011893600002000001234552045411530336054'.strlen((string) round($amount)).round($amount).'5802ID5918TOKO RITEL MANDIRI6008PONOROGO6304A1B2'),
-                        'reference_id' => $referenceId,
-                        'amount' => $amount,
+                        'qr_id' => (string) ($json['reference'] ?? ('duitku_'.$merchantOrderId)),
+                        'qr_string' => (string) ($json['qrString'] ?? ''),
+                        'payment_url' => (string) ($json['paymentUrl'] ?? ''),
+                        'va_number' => (string) ($json['vaNumber'] ?? ''),
+                        'payment_method' => $method,
+                        'reference_id' => $merchantOrderId,
+                        'amount' => (float) $paymentAmount,
                         'provider' => $config['mode_label'],
-                        'is_xendit_live' => true,
+                        'is_duitku_live' => true,
+                        'is_sandbox' => $isSandbox,
+                        'gateway_error' => null,
+                        'qris_image_url' => $config['qris_image_url'],
+                        'merchant_name' => $config['merchant_name'],
+                        'merchant_nmid' => $config['merchant_nmid'],
                         'settlement_destination' => $config['settlement_destination'],
                     ];
                 }
-            } catch (Throwable) {
-                // Fallback ke generator EMVCo QRIS Xendit Development jika menggunakan Public Key atau offline
+
+                $rawErr = (string) ($json['Message'] ?? $json['statusMessage'] ?? '');
+                if ($paymentAmount < 10000) {
+                    $gatewayError = 'Tagihan saat ini Rp '.number_format($paymentAmount, 0, ',', '.').'. Dari ketentuan server Duitku, metode Virtual Account / Payment Gateway Duitku mewajibkan minimal transaksi Rp 10.000. Untuk belanja di bawah Rp 10.000 silakan gunakan QRIS Toko (Manual) atau Saldo RFID.';
+                } else {
+                    $gatewayError = $rawErr !== '' ? "Duitku API: {$rawErr}" : 'Metode pembayaran ini sedang tidak tersedia di Duitku Sandbox.';
+                }
+            } catch (Throwable $e) {
+                $gatewayError = 'Tidak dapat terhubung ke server Duitku: '.$e->getMessage();
             }
         }
 
@@ -142,15 +174,19 @@ class PaymentGatewayHelper
             $dynamicQris = self::convertStaticQrisToDynamic($staticQris, $amount);
 
             return [
-                'qr_id' => 'qris_merchant_'.strtolower($referenceId),
+                'qr_id' => 'qris_merchant_'.strtolower($merchantOrderId),
                 'qr_string' => $dynamicQris,
+                'payment_url' => '',
+                'va_number' => '',
+                'payment_method' => $method,
                 'qris_image_url' => $config['qris_image_url'],
                 'merchant_name' => $config['merchant_name'],
                 'merchant_nmid' => $config['merchant_nmid'],
-                'reference_id' => $referenceId,
+                'reference_id' => $merchantOrderId,
                 'amount' => $amount,
                 'provider' => $config['mode_label'],
-                'is_xendit_live' => false,
+                'is_duitku_live' => false,
+                'is_sandbox' => $isSandbox,
                 'settlement_destination' => $config['settlement_destination'],
             ];
         }
@@ -161,17 +197,103 @@ class PaymentGatewayHelper
             .'5802ID5918TOKO RITEL MANDIRI6008PONOROGO62180114'.$kodeTransaksi.'6304BRI1';
 
         return [
-            'qr_id' => 'qris_local_'.strtolower($referenceId),
+            'qr_id' => 'qris_local_'.strtolower($merchantOrderId),
             'qr_string' => $emvQris,
+            'payment_url' => '',
+            'va_number' => '',
+            'payment_method' => $method,
             'qris_image_url' => $config['qris_image_url'],
             'merchant_name' => $config['merchant_name'],
             'merchant_nmid' => $config['merchant_nmid'],
-            'reference_id' => $referenceId,
+            'reference_id' => $merchantOrderId,
             'amount' => $amount,
             'provider' => $config['mode_label'],
-            'is_xendit_live' => false,
+            'is_duitku_live' => false,
+            'is_sandbox' => $isSandbox,
+            'gateway_error' => $gatewayError,
             'settlement_destination' => $config['settlement_destination'],
         ];
+    }
+
+    /**
+     * Mengecek status pembayaran transaksi langsung ke API Duitku (`transactionStatus`).
+     *
+     * @return array{ok: bool, is_paid: bool, status_code: string, status_message: string, reference: string}
+     */
+    public static function checkDuitkuTransactionStatus(string $merchantOrderId): array
+    {
+        $config = self::getGatewayConfigInfo();
+        $merchantCode = $config['merchant_code'];
+        $apiKey = trim((string) config('services.duitku.api_key', env('DUITKU_API_KEY', '')));
+
+        if ($merchantCode === '' || $apiKey === '') {
+            return [
+                'ok' => false,
+                'is_paid' => false,
+                'status_code' => '99',
+                'status_message' => 'Kredensial Duitku belum dikonfigurasi.',
+                'reference' => '',
+            ];
+        }
+
+        $baseUrl = $config['sandbox']
+            ? 'https://sandbox.duitku.com/webapi/api/merchant'
+            : 'https://passport.duitku.com/webapi/api/merchant';
+
+        $signature = md5($merchantCode.$merchantOrderId.$apiKey);
+
+        try {
+            $http = Http::withHeaders(['Content-Type' => 'application/json'])
+                ->timeout(10);
+
+            if ($config['sandbox'] && app()->isLocal()) {
+                $http = $http->withoutVerifying();
+            }
+
+            $response = $http->post("{$baseUrl}/transactionStatus", [
+                'merchantCode' => $merchantCode,
+                'merchantOrderId' => $merchantOrderId,
+                'signature' => $signature,
+            ]);
+
+            $json = $response->json() ?? [];
+            $statusCode = (string) ($json['statusCode'] ?? '01');
+
+            return [
+                'ok' => $response->successful(),
+                'is_paid' => $statusCode === '00',
+                'status_code' => $statusCode,
+                'status_message' => (string) ($json['statusMessage'] ?? 'PENDING'),
+                'reference' => (string) ($json['reference'] ?? ''),
+            ];
+        } catch (Throwable $e) {
+            return [
+                'ok' => false,
+                'is_paid' => false,
+                'status_code' => '99',
+                'status_message' => $e->getMessage(),
+                'reference' => '',
+            ];
+        }
+    }
+
+    /**
+     * Memverifikasi signature Callback / Webhook dari server Duitku.
+     */
+    public static function verifyDuitkuCallbackSignature(
+        string $merchantCode,
+        string $amount,
+        string $merchantOrderId,
+        string $signature
+    ): bool {
+        $apiKey = trim((string) config('services.duitku.api_key', env('DUITKU_API_KEY', '')));
+        if ($apiKey === '' || $merchantCode === '' || $merchantOrderId === '' || $signature === '') {
+            return false;
+        }
+
+        $expected = md5($merchantCode.$amount.$merchantOrderId.$apiKey);
+
+        return hash_equals(strtolower($expected), strtolower($signature));
     }
 
     /**
@@ -276,7 +398,7 @@ class PaymentGatewayHelper
             $detectedFromQr = ! empty($rawToken) ? self::detectCpmProvider($rawToken, $requestedChannel) : null;
             $channel = (! empty($requestedChannel) && strtoupper($requestedChannel) !== 'AUTO')
                 ? strtoupper(trim($requestedChannel))
-                : ($detectedFromQr ?: 'QRIS XENDIT / BANK BRI');
+                : ($detectedFromQr ?: 'QRIS DUITKU');
 
             $token = ! empty($rawToken) ? self::maskToken($rawToken) : 'QRIS-MPM-VERIFIED';
             $refPrefix = self::extractPrefixCode($channel);

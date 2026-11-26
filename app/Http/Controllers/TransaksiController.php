@@ -236,18 +236,131 @@ class TransaksiController extends Controller
     }
 
     /**
-     * Endpoint untuk membuat QRIS Dinamis via Xendit API (atau EMVCo QRIS Standar Bank Indonesia).
+     * Endpoint untuk membuat QRIS / Virtual Account Dinamis via Duitku V2 Inquiry API (Sandbox / Production).
      */
     public function createQris(Request $request): JsonResponse
     {
         $kodeTransaksi = (string) ($request->input('kode_transaksi') ?: ('TRX-'.now()->format('Ym').'-0001'));
-        $amount = max(1000.0, (float) ($request->input('amount') ?: 0));
+        $amount = max(1.0, (float) ($request->input('amount') ?: 0));
+        $paymentMethod = (string) ($request->input('payment_method') ?: '');
 
-        $qrisData = PaymentGatewayHelper::createDynamicQris($kodeTransaksi, $amount);
+        $user = $request->user();
+        $qrisData = PaymentGatewayHelper::createDynamicQris(
+            $kodeTransaksi,
+            $amount,
+            $paymentMethod,
+            $user?->email,
+            $user?->nama_lengkap
+        );
 
         return response()->json([
             'ok' => true,
             'data' => $qrisData,
         ]);
+    }
+
+    /**
+     * Mengecek status transaksi secara real-time (Auto-Check Polling):
+     * 1. Mengecek database lokal terlebih dahulu (untuk QRIS GoPay Merchant yang diverifikasi Kasir / Webhook).
+     * 2. Mengecek langsung ke API Duitku (`transactionStatus`) dan otomatis melunasi jika statusCode === '00'.
+     */
+    public function checkDuitkuStatus(Request $request): JsonResponse
+    {
+        $merchantOrderId = trim((string) $request->input('merchant_order_id', ''));
+        $idTransaksi = (int) $request->input('id_transaksi', 0);
+        $checkLocalOnly = (bool) $request->boolean('local_only', false);
+
+        $trx = $idTransaksi > 0 ? Transaksi::with(['pelanggan', 'kasir', 'detail.produk'])->find($idTransaksi) : null;
+
+        // 1. Jika di database lokal sudah berstatus 'selesai' (misal diverifikasi Kasir atau via Webhook), langsung kembalikan LUNAS
+        if ($trx && $trx->status === 'selesai') {
+            return response()->json([
+                'ok' => true,
+                'is_paid' => true,
+                'status_code' => '00',
+                'message' => "Pembayaran {$trx->kode_transaksi} telah terverifikasi LUNAS!",
+                'data' => $trx,
+            ]);
+        }
+
+        if ($checkLocalOnly) {
+            return response()->json([
+                'ok' => true,
+                'is_paid' => false,
+                'status_code' => '01',
+                'message' => 'Menunggu verifikasi pembayaran...',
+            ]);
+        }
+
+        if ($merchantOrderId === '' && $trx) {
+            $merchantOrderId = $trx->kode_transaksi;
+        }
+
+        if ($merchantOrderId === '') {
+            return response()->json([
+                'ok' => false,
+                'is_paid' => false,
+                'message' => 'Kode transaksi / merchantOrderId wajib diisi.',
+            ], 422);
+        }
+
+        $status = PaymentGatewayHelper::checkDuitkuTransactionStatus($merchantOrderId);
+
+        if ($status['is_paid'] && $trx && $trx->status === 'pending') {
+            $transaksi = $this->transaksiHandler->konfirmasiPembayaran($trx->id_transaksi, [
+                'payment_ref' => $status['reference'] ?: ('DUITKU-'.$merchantOrderId),
+                'nominal_bayar' => $trx->total_belanja,
+            ]);
+
+            return response()->json([
+                'ok' => true,
+                'is_paid' => true,
+                'status_code' => '00',
+                'message' => "Pembayaran Duitku terverifikasi LUNAS ({$transaksi->payment_ref}).",
+                'data' => $transaksi,
+            ]);
+        }
+
+        return response()->json([
+            'ok' => $status['ok'],
+            'is_paid' => $status['is_paid'],
+            'status_code' => $status['status_code'],
+            'message' => $status['status_message'],
+        ]);
+    }
+
+    /**
+     * Webhook Callback Resmi dari Server Duitku (`callbackUrl`).
+     */
+    public function duitkuCallback(Request $request): JsonResponse
+    {
+        $merchantCode = (string) $request->input('merchantCode', '');
+        $amount = (string) $request->input('amount', '');
+        $merchantOrderId = (string) $request->input('merchantOrderId', '');
+        $signature = (string) $request->input('signature', '');
+        $resultCode = (string) $request->input('resultCode', '');
+        $reference = (string) $request->input('reference', '');
+
+        if (! PaymentGatewayHelper::verifyDuitkuCallbackSignature($merchantCode, $amount, $merchantOrderId, $signature)) {
+            return response()->json(['ok' => false, 'message' => 'Invalid signature'], 403);
+        }
+
+        if ($resultCode === '00') {
+            $kodeBase = explode('-', $merchantOrderId);
+            $kodeTransaksi = count($kodeBase) >= 3 ? implode('-', array_slice($kodeBase, 0, 3)) : $merchantOrderId;
+
+            $transaksi = Transaksi::where('kode_transaksi', $merchantOrderId)
+                ->orWhere('kode_transaksi', $kodeTransaksi)
+                ->first();
+
+            if ($transaksi && $transaksi->status === 'pending') {
+                $this->transaksiHandler->konfirmasiPembayaran($transaksi->id_transaksi, [
+                    'payment_ref' => $reference ?: ('DUITKU-CB-'.$merchantOrderId),
+                    'nominal_bayar' => (float) $amount,
+                ]);
+            }
+        }
+
+        return response()->json(['ok' => true]);
     }
 }

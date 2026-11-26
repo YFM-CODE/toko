@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue';
 import { Head, router } from '@inertiajs/vue3';
 import AdminLayout from '@/Layouts/AdminLayout.vue';
 import ReceiptModal from '@/Components/Pos/ReceiptModal.vue';
@@ -47,6 +47,7 @@ const selectedKategoriId = ref('');
 const cart = ref([]);
 const usePoints = ref(false);
 const metodePembayaran = ref('QRIS_MPM');
+const paymentSubMode = ref('MANUAL_QRIS'); // 'MANUAL_QRIS' | 'DUITKU_AUTO'
 const isProcessing = ref(false);
 const errorMessage = ref('');
 const successMessage = ref('');
@@ -54,7 +55,7 @@ const successMessage = ref('');
 const selectedReceipt = ref(null);
 const showReceiptModal = ref(false);
 
-// Modal Tagihan Belum Dibayar (status = 'pending') — Struk dikunci sampai diverifikasi Kasir!
+// Modal Tagihan Belum Dibayar (status = 'pending') — Struk dikunci sampai lunas di Duitku / diverifikasi Kasir!
 const pendingInvoice = ref(null);
 const showPendingPaymentModal = ref(false);
 const paymentRefInput = ref('');
@@ -62,6 +63,172 @@ const proofFile = ref(null);
 const proofPreviewUrl = ref(null);
 const isConfirmingPayment = ref(false);
 const paymentModalError = ref('');
+
+const selectedDuitkuBank = ref('BR');
+const duitkuInvoiceData = ref(null);
+const loadingDuitkuInvoice = ref(false);
+const copiedDuitkuLabel = ref('');
+const checkingDuitkuStatus = ref(false);
+const duitkuCheckMessage = ref('');
+const showManualProofUpload = ref(false);
+
+const duitkuBanks = [
+    { id: 'BR', short: 'BRI VA', label: 'BRI Virtual Account (BRIVA)' },
+    { id: 'BC', short: 'BCA VA', label: 'BCA Virtual Account' },
+    { id: 'M2', short: 'Mandiri VA', label: 'Mandiri Virtual Account' },
+    { id: 'I1', short: 'BNI VA', label: 'BNI Virtual Account' },
+    { id: 'B1', short: 'CIMB VA', label: 'CIMB Niaga Virtual Account' },
+    { id: 'SP', short: 'QRIS', label: 'QRIS Duitku (All Bank & E-Wallet)' },
+    { id: 'DA', short: 'DANA', label: 'DANA E-Wallet' },
+];
+
+const copyDuitkuCode = async (text, label = 'Kode') => {
+    if (!text) {
+        return;
+    }
+    try {
+        await navigator.clipboard.writeText(String(text));
+        copiedDuitkuLabel.value = `${label} berhasil disalin!`;
+        playBeepSound();
+        setTimeout(() => {
+            copiedDuitkuLabel.value = '';
+        }, 2500);
+    } catch {
+        copiedDuitkuLabel.value = `Salin manual: ${text}`;
+    }
+};
+
+const fetchMemberDuitkuInquiry = async (trx = null) => {
+    const target = trx || pendingInvoice.value;
+    if (!target) {
+        return;
+    }
+    loadingDuitkuInvoice.value = true;
+    duitkuCheckMessage.value = '';
+    try {
+        const csrfToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || '';
+        const res = await fetch('/api/payment/duitku-qris', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Accept: 'application/json',
+                'X-CSRF-TOKEN': csrfToken,
+            },
+            body: JSON.stringify({
+                kode_transaksi: target.kode_transaksi,
+                amount: target.total_belanja,
+                payment_method: selectedDuitkuBank.value,
+            }),
+        });
+        const payload = await res.json();
+        if (payload?.data) {
+            duitkuInvoiceData.value = payload.data;
+        }
+    } catch {
+        // Fallback if offline
+    } finally {
+        loadingDuitkuInvoice.value = false;
+    }
+};
+
+const switchMemberDuitkuBank = (bankId) => {
+    selectedDuitkuBank.value = bankId;
+    fetchMemberDuitkuInquiry();
+};
+
+const checkMemberDuitkuStatus = async (silent = false, targetTrx = null) => {
+    const trxToCheck = targetTrx || pendingInvoice.value;
+    if (!trxToCheck || checkingDuitkuStatus.value) {
+        return;
+    }
+
+    const isLocalManualCheck = modalPayTab.value === 'MANUAL_QRIS' || Boolean(targetTrx);
+    if (!isLocalManualCheck && duitkuInvoiceData.value?.gateway_error) {
+        return;
+    }
+
+    checkingDuitkuStatus.value = true;
+    if (!silent) {
+        duitkuCheckMessage.value = 'Mengecek status pembayaran...';
+    }
+    try {
+        const csrfToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || '';
+        const res = await fetch('/api/payment/duitku/check-status', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Accept: 'application/json',
+                'X-CSRF-TOKEN': csrfToken,
+            },
+            body: JSON.stringify({
+                id_transaksi: trxToCheck.id_transaksi,
+                merchant_order_id: duitkuInvoiceData.value?.reference_id || trxToCheck.kode_transaksi,
+                local_only: isLocalManualCheck,
+            }),
+        });
+        const payload = await res.json();
+        if (payload?.is_paid && payload?.data) {
+            stopMemberAutoCheck();
+            playBeepSound();
+            showPendingPaymentModal.value = false;
+            pendingInvoice.value = null;
+            selectedReceipt.value = payload.data;
+            showReceiptModal.value = true;
+            successMessage.value = payload.message || 'Pembayaran terverifikasi LUNAS! Struk resmi siap dicetak.';
+            router.reload({ only: ['pelanggan', 'stats', 'riwayatTransaksi', 'produkKatalog'] });
+        } else if (!silent) {
+            duitkuCheckMessage.value = `Status: ${payload?.message || 'BELUM LUNAS (PENDING)'} — Sistem tetap mengecek otomatis setiap 3 detik.`;
+        }
+    } catch {
+        if (!silent) {
+            duitkuCheckMessage.value = 'Gagal memeriksa status pembayaran.';
+        }
+    } finally {
+        checkingDuitkuStatus.value = false;
+    }
+};
+
+let memberAutoCheckTimer = null;
+
+const stopMemberAutoCheck = () => {
+    if (memberAutoCheckTimer) {
+        clearInterval(memberAutoCheckTimer);
+        memberAutoCheckTimer = null;
+    }
+};
+
+const startMemberAutoCheck = () => {
+    stopMemberAutoCheck();
+    memberAutoCheckTimer = setInterval(() => {
+        if (showPendingPaymentModal.value && pendingInvoice.value?.status === 'pending') {
+            checkMemberDuitkuStatus(true);
+            return;
+        }
+        // Jika modal ditutup tetapi ada pesanan 'pending' (misal QRIS GoPay yang menunggu verifikasi Kasir),
+        // cek otomatis ke database agar begitu Kasir memverifikasi, Struk langsung terbuka otomatis di layar Member!
+        const firstPending = (props.riwayatTransaksi || []).find((t) => t.status === 'pending');
+        if (firstPending && !showReceiptModal.value) {
+            checkMemberDuitkuStatus(true, firstPending);
+        }
+    }, 3500);
+};
+
+watch(
+    [showPendingPaymentModal, () => props.riwayatTransaksi],
+    () => {
+        const hasPendingInList = (props.riwayatTransaksi || []).some((t) => t.status === 'pending');
+        if (showPendingPaymentModal.value || hasPendingInList) {
+            startMemberAutoCheck();
+        } else {
+            stopMemberAutoCheck();
+        }
+    },
+    { immediate: true },
+);
+
+onBeforeUnmount(() => {
+    stopMemberAutoCheck();
+});
 
 const memberScanCode = computed(() => {
     return props.pelanggan?.rfid_uid || `MBR-${props.pelanggan?.id_pelanggan}`;
@@ -199,7 +366,9 @@ const submitSelfCheckout = async () => {
                 metode_pembayaran: metodePembayaran.value,
                 payment_channel:
                     metodePembayaran.value === 'QRIS_MPM'
-                        ? 'QRIS GOPAY MERCHANT (ONLINE)'
+                        ? paymentSubMode.value === 'DUITKU_AUTO'
+                            ? `DUITKU ${duitkuBanks.find((b) => b.id === selectedDuitkuBank.value)?.short || selectedDuitkuBank.value}`
+                            : 'QRIS GOPAY MERCHANT (MANUAL)'
                         : metodePembayaran.value === 'SALDO_MEMBER'
                           ? 'SALDO MEMBER RFID'
                           : 'TUNAI DI KASIR',
@@ -227,11 +396,8 @@ const submitSelfCheckout = async () => {
             showReceiptModal.value = true;
             successMessage.value = result.message || 'Pembayaran berhasil! Struk siap dicetak.';
         } else {
-            // Jika belum dibayar (status === 'pending'), BUKA MODAL TAGIHAN PEMBAYARAN (Bukan Struk!)
-            pendingInvoice.value = result.data;
-            paymentRefInput.value = '';
-            paymentModalError.value = '';
-            showPendingPaymentModal.value = true;
+            // Jika belum dibayar (status === 'pending'), BUKA MODAL TAGIHAN PEMBAYARAN DUITKU (Bukan Struk!)
+            openPendingInvoiceModal(result.data);
             activeTab.value = 'riwayat';
             successMessage.value = result.message;
         }
@@ -244,13 +410,28 @@ const submitSelfCheckout = async () => {
     }
 };
 
+const modalPayTab = ref('MANUAL_QRIS'); // 'MANUAL_QRIS' | 'DUITKU_AUTO'
+
 const openPendingInvoiceModal = (trx) => {
     pendingInvoice.value = trx;
     paymentRefInput.value = trx.payment_ref && trx.payment_ref !== 'WAITING-PAYMENT' && trx.payment_ref !== 'MENUNGGU-VERIFIKASI-KASIR' ? trx.payment_ref : '';
     proofFile.value = null;
     proofPreviewUrl.value = trx.bukti_pembayaran_url || null;
     paymentModalError.value = '';
+    duitkuCheckMessage.value = '';
+    const isDuitkuChannel = String(trx.payment_channel || '').toUpperCase().includes('DUITKU');
+    modalPayTab.value = isDuitkuChannel ? 'DUITKU_AUTO' : 'MANUAL_QRIS';
     showPendingPaymentModal.value = true;
+    if (trx.metode_pembayaran === 'QRIS_MPM' && isDuitkuChannel) {
+        fetchMemberDuitkuInquiry(trx);
+    }
+};
+
+const switchModalPayTab = (tab) => {
+    modalPayTab.value = tab;
+    if (tab === 'DUITKU_AUTO' && pendingInvoice.value) {
+        fetchMemberDuitkuInquiry(pendingInvoice.value);
+    }
 };
 
 const handleProofFileChange = (event) => {
@@ -685,18 +866,36 @@ onMounted(() => {
                             <label class="block text-xs font-semibold uppercase text-slate-600">
                                 Metode Pembayaran
                             </label>
-                            <div class="grid grid-cols-3 gap-2">
+                            <div class="grid grid-cols-2 gap-2">
                                 <button
                                     type="button"
-                                    @click="metodePembayaran = 'QRIS_MPM'"
+                                    @click="
+                                        metodePembayaran = 'QRIS_MPM';
+                                        paymentSubMode = 'MANUAL_QRIS';
+                                    "
                                     class="py-2 px-2 rounded-md border text-xs font-semibold text-center transition"
                                     :class="
-                                        metodePembayaran === 'QRIS_MPM'
+                                        metodePembayaran === 'QRIS_MPM' && paymentSubMode === 'MANUAL_QRIS'
                                             ? 'bg-[#1E3A5F] text-white border-[#1E3A5F]'
                                             : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
                                     "
                                 >
-                                    QRIS GoPay
+                                    QRIS Toko (Manual)
+                                </button>
+                                <button
+                                    type="button"
+                                    @click="
+                                        metodePembayaran = 'QRIS_MPM';
+                                        paymentSubMode = 'DUITKU_AUTO';
+                                    "
+                                    class="py-2 px-2 rounded-md border text-xs font-semibold text-center transition"
+                                    :class="
+                                        metodePembayaran === 'QRIS_MPM' && paymentSubMode === 'DUITKU_AUTO'
+                                            ? 'bg-[#1E3A5F] text-white border-[#1E3A5F]'
+                                            : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+                                    "
+                                >
+                                    Duitku VA / QRIS (Otomatis)
                                 </button>
                                 <button
                                     type="button"
@@ -724,13 +923,44 @@ onMounted(() => {
                                 </button>
                             </div>
 
+                            <!-- Pilihan Bank Virtual Account / QRIS Duitku (Hanya muncul jika pilih Duitku Otomatis) -->
+                            <div
+                                v-if="metodePembayaran === 'QRIS_MPM' && paymentSubMode === 'DUITKU_AUTO'"
+                                class="pt-1 space-y-1.5"
+                            >
+                                <div class="text-[11px] font-semibold text-slate-600">
+                                    Pilih Bank Virtual Account / Channel Duitku:
+                                </div>
+                                <div class="flex flex-wrap gap-1.5">
+                                    <button
+                                        v-for="b in duitkuBanks"
+                                        :key="b.id"
+                                        type="button"
+                                        @click="selectedDuitkuBank = b.id"
+                                        class="px-2.5 py-1 rounded border text-[11px] font-semibold transition"
+                                        :class="
+                                            selectedDuitkuBank === b.id
+                                                ? 'bg-[#1E3A5F] text-white border-[#1E3A5F]'
+                                                : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+                                        "
+                                    >
+                                        {{ b.short }}
+                                    </button>
+                                </div>
+                            </div>
+
                             <div class="p-2.5 rounded-md border border-slate-300 bg-slate-50 text-[11px] text-slate-600">
                                 <template v-if="metodePembayaran === 'SALDO_MEMBER'">
                                     Saldo Anda: <strong class="font-mono text-slate-900">{{ formatRupiah(stats.saldo || 0) }}</strong>.
                                     Pembayaran langsung memotong saldo dan <strong>langsung Lunas &amp; Cetak Struk</strong>.
                                 </template>
-                                <template v-else-if="metodePembayaran === 'QRIS_MPM'">
-                                    Pesanan akan berstatus <strong>MENUNGGU PEMBAYARAN</strong>. Struk baru bisa dicetak setelah Anda menyelesaikan scan QRIS &amp; verifikasi pembayaran.
+                                <template v-else-if="metodePembayaran === 'QRIS_MPM' && paymentSubMode === 'MANUAL_QRIS'">
+                                    <strong>QRIS Resmi Toko (Manual — {{ gatewayConfig.merchant_name || 'YAZID, ELEKTRONIK' }}):</strong>
+                                    Bebas nominal berapa pun (sesuai harga asli). Setelah scan QRIS, unggah foto bukti transfer untuk <strong>diverifikasi manual oleh Kasir</strong>.
+                                </template>
+                                <template v-else-if="metodePembayaran === 'QRIS_MPM' && paymentSubMode === 'DUITKU_AUTO'">
+                                    <strong>Duitku Sandbox (Otomatis — {{ duitkuBanks.find((b) => b.id === selectedDuitkuBank)?.label }}):</strong>
+                                    Dapatkan <strong>Nomor Virtual Account / Kode Bayar</strong> untuk di-<strong>Copy</strong> &amp; dicoba di Simulator Duitku Sandbox (minimal transaksi VA di Duitku Rp 10.000).
                                 </template>
                                 <template v-else>
                                     Pesanan akan berstatus <strong>MENUNGGU PEMBAYARAN DI KASIR</strong>. Struk dikunci sampai Anda membayar tunai dan dikonfirmasi lunas oleh Kasir.
@@ -870,7 +1100,7 @@ onMounted(() => {
                                         @click="openPendingInvoiceModal(trx)"
                                         class="px-2.5 py-1 rounded text-white bg-[#1E3A5F] hover:bg-[#162C49] font-medium"
                                     >
-                                        {{ trx.bukti_pembayaran ? 'Lihat / Ganti Bukti' : 'Upload Bukti Bayar' }}
+                                        {{ trx.bukti_pembayaran ? 'Lihat Status / Bukti' : 'Bayar / Copy VA Duitku' }}
                                     </button>
                                     <span v-else class="text-slate-400 text-[11px]">-</span>
                                 </td>
@@ -921,68 +1151,270 @@ onMounted(() => {
                     </div>
                 </div>
 
-                <!-- Jika Metode Pembayaran adalah QRIS -->
+                <!-- Jika Metode Pembayaran adalah QRIS Toko (Manual) atau Duitku (Otomatis) -->
                 <div v-if="pendingInvoice.metode_pembayaran === 'QRIS_MPM'" class="space-y-3">
-                    <div class="p-3 rounded-md border border-slate-300 bg-white text-center space-y-2">
-                        <div class="text-xs font-semibold text-slate-800">
-                            Scan QRIS Resmi: {{ gatewayConfig.merchant_name || 'YAZID, ELEKTRONIK' }}
-                        </div>
-                        <img
-                            :src="gatewayConfig.static_qris_image_url || '/images/qris-toko.jpg'"
-                            alt="QRIS GoPay Merchant"
-                            class="w-44 mx-auto rounded border border-slate-300 p-1 bg-white"
-                        />
-                        <div class="text-[11px] text-slate-600">
-                            Transfer tepat sebesar <strong class="font-mono text-slate-900">{{ formatRupiah(pendingInvoice.total_belanja) }}</strong>, lalu unggah foto/screenshot bukti transfer di bawah ini agar <strong>Kasir dapat memverifikasi</strong> pesanan Anda.
-                        </div>
-                    </div>
-
-                    <div>
-                        <label class="block font-semibold text-slate-700 mb-1">
-                            Upload Foto / Screenshot Bukti Transfer QRIS *
-                        </label>
-                        <input
-                            type="file"
-                            accept="image/jpeg,image/png,image/webp"
-                            @change="handleProofFileChange"
-                            class="w-full text-xs border border-slate-300 rounded-md p-1.5 bg-white"
-                        />
-                        <div v-if="proofPreviewUrl" class="mt-2 p-2 border border-slate-200 rounded bg-slate-50 text-center">
-                            <img :src="proofPreviewUrl" alt="Preview Bukti Bayar" class="max-h-36 mx-auto rounded" />
-                        </div>
-                    </div>
-
-                    <div>
-                        <label class="block font-semibold text-slate-700 mb-1">
-                            Nomor Referensi / Catatan (Opsional)
-                        </label>
-                        <input
-                            v-model="paymentRefInput"
-                            type="text"
-                            placeholder="Contoh: GOPAY-99283123 atau nama pengirim..."
-                            class="w-full px-3 py-2 rounded-md border border-slate-300 font-mono font-semibold text-slate-900"
-                        />
-                        <div v-if="paymentModalError" class="text-red-700 font-medium mt-1">
-                            {{ paymentModalError }}
-                        </div>
-                    </div>
-
-                    <div class="flex justify-end gap-2 pt-2">
+                    <!-- Tab Switcher: QRIS Toko (Manual) vs Duitku Sandbox (Otomatis) -->
+                    <div class="grid grid-cols-2 gap-1.5 p-1 rounded-md bg-slate-100 border border-slate-300">
                         <button
                             type="button"
-                            @click="showPendingPaymentModal = false"
-                            class="px-3 py-2 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 font-medium"
+                            @click="switchModalPayTab('MANUAL_QRIS')"
+                            class="py-1.5 px-2 rounded text-xs font-semibold transition"
+                            :class="
+                                modalPayTab === 'MANUAL_QRIS'
+                                    ? 'bg-[#1E3A5F] text-white'
+                                    : 'text-slate-700 hover:bg-white'
+                            "
                         >
-                            Tutup
+                            QRIS Toko (Manual)
                         </button>
                         <button
                             type="button"
-                            :disabled="isConfirmingPayment"
-                            @click="uploadProofPayment"
-                            class="px-4 py-2 rounded-md font-semibold text-white bg-[#1E3A5F] hover:bg-[#162C49] disabled:opacity-50"
+                            @click="switchModalPayTab('DUITKU_AUTO')"
+                            class="py-1.5 px-2 rounded text-xs font-semibold transition"
+                            :class="
+                                modalPayTab === 'DUITKU_AUTO'
+                                    ? 'bg-[#1E3A5F] text-white'
+                                    : 'text-slate-700 hover:bg-white'
+                            "
                         >
-                            {{ isConfirmingPayment ? 'Mengunggah...' : 'Kirim Bukti ke Kasir' }}
+                            Duitku VA/QR (Otomatis)
                         </button>
+                    </div>
+
+                    <!-- MODE 1: QRIS RESMI TOKO (MANUAL — UPLOAD BUKTI & AUTO-CHECK VERIFIKASI KASIR) -->
+                    <div v-if="modalPayTab === 'MANUAL_QRIS'" class="space-y-3">
+                        <div class="flex items-center justify-center gap-1.5 py-1.5 px-2.5 rounded bg-emerald-50 border border-emerald-200 text-emerald-800 text-[11px] font-semibold">
+                            <span class="w-2 h-2 rounded-full bg-emerald-600 animate-ping"></span>
+                            <span>AUTO-CHECK AKTIF: Struk akan terbuka otomatis begitu diverifikasi Kasir</span>
+                        </div>
+
+                        <div class="p-3 rounded-md border border-slate-300 bg-white text-center space-y-2">
+                            <div class="text-xs font-semibold text-slate-800">
+                                Scan QRIS Resmi: {{ gatewayConfig.merchant_name || 'YAZID, ELEKTRONIK' }}
+                            </div>
+                            <img
+                                :src="gatewayConfig.qris_image_url || '/images/qris-toko.jpg'"
+                                alt="QRIS GoPay Merchant"
+                                class="w-44 mx-auto rounded border border-slate-300 p-1 bg-white"
+                            />
+                            <div class="text-[11px] text-slate-600">
+                                Transfer sesuai tagihan asli <strong class="font-mono text-slate-900">{{ formatRupiah(pendingInvoice.total_belanja) }}</strong>, lalu unggah foto/screenshot bukti transfer di bawah ini agar <strong>diverifikasi manual oleh Kasir</strong>.
+                            </div>
+                        </div>
+
+                        <div>
+                            <label class="block font-semibold text-slate-700 mb-1">
+                                Upload Foto / Screenshot Bukti Transfer QRIS *
+                            </label>
+                            <input
+                                type="file"
+                                accept="image/jpeg,image/png,image/webp"
+                                @change="handleProofFileChange"
+                                class="w-full text-xs border border-slate-300 rounded-md p-1.5 bg-white"
+                            />
+                            <div v-if="proofPreviewUrl" class="mt-2 p-2 border border-slate-200 rounded bg-slate-50 text-center">
+                                <img :src="proofPreviewUrl" alt="Preview Bukti Bayar" class="max-h-36 mx-auto rounded" />
+                            </div>
+                        </div>
+
+                        <div>
+                            <label class="block font-semibold text-slate-700 mb-1">
+                                Nomor Referensi / Catatan (Opsional)
+                            </label>
+                            <input
+                                v-model="paymentRefInput"
+                                type="text"
+                                placeholder="Contoh: GOPAY-99283123 atau nama pengirim..."
+                                class="w-full px-3 py-2 rounded-md border border-slate-300 font-mono font-semibold text-slate-900"
+                            />
+                            <div v-if="paymentModalError" class="text-red-700 font-medium mt-1">
+                                {{ paymentModalError }}
+                            </div>
+                        </div>
+
+                        <div class="flex justify-end gap-2 pt-1">
+                            <button
+                                type="button"
+                                @click="showPendingPaymentModal = false"
+                                class="px-3 py-2 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 font-medium"
+                            >
+                                Tutup
+                            </button>
+                            <button
+                                type="button"
+                                :disabled="isConfirmingPayment"
+                                @click="uploadProofPayment"
+                                class="px-4 py-2 rounded-md font-semibold text-white bg-[#1E3A5F] hover:bg-[#162C49] disabled:opacity-50"
+                            >
+                                {{ isConfirmingPayment ? 'Mengunggah...' : 'Kirim Bukti ke Kasir' }}
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- MODE 2: DUITKU SANDBOX (OTOMATIS — PILIH BANK VA, COPY KODE, SIMULATOR SANDBOX) -->
+                    <div v-else class="space-y-3">
+                        <div class="space-y-1.5">
+                            <div class="text-[11px] font-semibold text-slate-700">
+                                Pilih Bank Virtual Account / QRIS Duitku Sandbox:
+                            </div>
+                            <div class="flex flex-wrap gap-1.5">
+                                <button
+                                    v-for="b in duitkuBanks"
+                                    :key="b.id"
+                                    type="button"
+                                    @click="switchMemberDuitkuBank(b.id)"
+                                    class="px-2.5 py-1 rounded border text-[11px] font-semibold transition"
+                                    :class="
+                                        selectedDuitkuBank === b.id
+                                            ? 'bg-[#1E3A5F] text-white border-[#1E3A5F]'
+                                            : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+                                    "
+                                >
+                                    {{ b.short }}
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="p-3 rounded-md border border-slate-300 bg-white text-center space-y-2.5">
+                            <div v-if="loadingDuitkuInvoice" class="py-6 text-slate-500 font-semibold">
+                                Membuat Kode Pembayaran di Duitku Sandbox ({{ selectedDuitkuBank }})...
+                            </div>
+
+                            <!-- Jika Nominal di bawah Rp 10.000 (Batas Minimal VA Duitku) -->
+                            <div
+                                v-else-if="duitkuInvoiceData?.gateway_error"
+                                class="p-3 rounded-md bg-amber-50 border border-amber-300 text-amber-900 text-left space-y-2"
+                            >
+                                <div class="font-bold text-xs">
+                                    ⚠ Informasi Batas Minimal Duitku Sandbox:
+                                </div>
+                                <p class="text-[11px] leading-relaxed">
+                                    {{ duitkuInvoiceData.gateway_error }}
+                                </p>
+                                <button
+                                    type="button"
+                                    @click="switchModalPayTab('MANUAL_QRIS')"
+                                    class="w-full py-2 px-3 rounded-md bg-[#1E3A5F] text-white text-xs font-semibold hover:bg-[#162C49]"
+                                >
+                                    Gunakan QRIS Toko (Manual — Bebas Nominal) &rarr;
+                                </button>
+                            </div>
+
+                            <template v-else>
+                                <!-- Nomor Virtual Account + Tombol Copy -->
+                                <div
+                                    v-if="duitkuInvoiceData?.va_number"
+                                    class="p-3 rounded-md bg-slate-50 border border-slate-300 space-y-2"
+                                >
+                                    <div class="text-[11px] font-semibold text-slate-500 uppercase">
+                                        NOMOR VIRTUAL ACCOUNT ({{ duitkuBanks.find((x) => x.id === selectedDuitkuBank)?.label }}):
+                                    </div>
+                                    <div class="text-lg sm:text-xl font-extrabold font-mono tracking-wider text-slate-900 select-all bg-white py-2 px-3 rounded border border-slate-300">
+                                        {{ duitkuInvoiceData.va_number }}
+                                    </div>
+                                    <div class="flex flex-wrap justify-center gap-2">
+                                        <button
+                                            type="button"
+                                            @click="copyDuitkuCode(duitkuInvoiceData.va_number, 'Nomor Virtual Account')"
+                                            class="px-3 py-1.5 rounded-md bg-[#1E3A5F] text-white text-xs font-semibold hover:bg-[#162C49]"
+                                        >
+                                            📋 Salin / Copy Nomor VA
+                                        </button>
+                                        <button
+                                            v-if="duitkuInvoiceData?.qr_id"
+                                            type="button"
+                                            @click="copyDuitkuCode(duitkuInvoiceData.qr_id, 'Reference Duitku')"
+                                            class="px-3 py-1.5 rounded-md border border-slate-300 bg-white text-slate-700 text-xs font-semibold hover:bg-slate-50"
+                                        >
+                                            📋 Copy Reference
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <!-- QRIS Dinamis Duitku jika memilih SP -->
+                                <div v-else-if="duitkuInvoiceData?.qr_string" class="space-y-2">
+                                    <div class="text-xs font-semibold text-slate-800">
+                                        QRIS Dinamis Duitku Sandbox ({{ gatewayConfig.merchant_code || 'DS38621' }})
+                                    </div>
+                                    <img
+                                        :src="generateQrSvgDataUrl(duitkuInvoiceData.qr_string)"
+                                        alt="QRIS Duitku Sandbox"
+                                        class="w-44 h-44 mx-auto rounded border border-slate-300 p-1 bg-white"
+                                    />
+                                    <button
+                                        type="button"
+                                        @click="copyDuitkuCode(duitkuInvoiceData.qr_id, 'Reference QRIS')"
+                                        class="px-3 py-1 rounded border border-slate-300 bg-white text-slate-700 text-[11px] font-semibold"
+                                    >
+                                        📋 Copy Reference: {{ duitkuInvoiceData.qr_id }}
+                                    </button>
+                                </div>
+
+                                <div
+                                    v-if="duitkuInvoiceData?.qr_id"
+                                    class="text-[11px] font-mono text-slate-600 bg-slate-50 p-2 rounded border border-slate-200 text-left space-y-0.5"
+                                >
+                                    <div class="flex justify-between">
+                                        <span>Reference Duitku:</span>
+                                        <strong class="text-slate-900 select-all">{{ duitkuInvoiceData.qr_id }}</strong>
+                                    </div>
+                                    <div class="flex justify-between">
+                                        <span>Merchant Order ID:</span>
+                                        <strong class="text-slate-900 select-all">{{ duitkuInvoiceData.reference_id }}</strong>
+                                    </div>
+                                    <div class="flex justify-between">
+                                        <span>Tagihan Asli:</span>
+                                        <strong class="text-slate-900">{{ formatRupiah(pendingInvoice.total_belanja) }}</strong>
+                                    </div>
+                                </div>
+
+                                <div
+                                    v-if="copiedDuitkuLabel"
+                                    class="py-1.5 px-3 rounded bg-emerald-50 border border-emerald-300 text-emerald-800 text-xs font-semibold"
+                                >
+                                    ✓ {{ copiedDuitkuLabel }}
+                                </div>
+
+                                <div v-if="duitkuInvoiceData?.payment_url" class="space-y-2 pt-1">
+                                    <div class="flex items-center justify-center gap-1.5 py-1.5 px-2.5 rounded bg-emerald-50 border border-emerald-200 text-emerald-800 text-[11px] font-semibold">
+                                        <span class="w-2 h-2 rounded-full bg-emerald-600 animate-ping"></span>
+                                        <span>AUTO-CHECK SANDBOX AKTIF (Otomatis Lunas &amp; Buka Struk tiap 3 detik)</span>
+                                    </div>
+                                    <a
+                                        :href="duitkuInvoiceData.payment_url"
+                                        target="_blank"
+                                        class="block w-full py-2 px-3 rounded-md bg-[#1E3A5F] text-white text-xs font-semibold hover:bg-[#162C49]"
+                                    >
+                                        ↗ 1. Buka Simulator Pembayaran Duitku Sandbox
+                                    </a>
+                                    <button
+                                        type="button"
+                                        :disabled="checkingDuitkuStatus"
+                                        @click="checkMemberDuitkuStatus(false)"
+                                        class="w-full py-2 px-3 rounded-md border border-slate-300 bg-white text-slate-800 hover:bg-slate-50 text-xs font-semibold"
+                                    >
+                                        {{ checkingDuitkuStatus ? 'Mengecek ke Server Duitku...' : '🔄 Cek Manual Sekarang' }}
+                                    </button>
+                                </div>
+
+                                <div
+                                    v-if="duitkuCheckMessage"
+                                    class="p-2 rounded border border-slate-300 bg-slate-50 text-[11px] font-medium text-slate-700"
+                                >
+                                    {{ duitkuCheckMessage }}
+                                </div>
+                            </template>
+                        </div>
+
+                        <div class="flex justify-end pt-1">
+                            <button
+                                type="button"
+                                @click="showPendingPaymentModal = false"
+                                class="px-3 py-1.5 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 font-medium"
+                            >
+                                Tutup
+                            </button>
+                        </div>
                     </div>
                 </div>
 

@@ -14,6 +14,7 @@ use App\Http\Controllers\ProfileController;
 use App\Http\Controllers\TransaksiController;
 use App\Http\Controllers\UserController;
 use App\Http\Controllers\WelcomeController;
+use Illuminate\Foundation\Http\Middleware\VerifyCsrfToken;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Route;
 
@@ -66,7 +67,27 @@ Route::middleware(['auth', 'role:kasir'])->group(function () {
     Route::get('/transaksi/create', [TransaksiController::class, 'create'])->name('transaksi.create');
     Route::post('/transaksi', [TransaksiController::class, 'store'])->name('transaksi.store');
     Route::post('/api/transaksi', [TransaksiController::class, 'store'])->name('api.transaksi.store');
-    Route::post('/api/payment/xendit-qris', [TransaksiController::class, 'createQris'])->name('api.payment.xendit-qris');
+});
+
+// Webhook Callback Resmi Duitku (Tanpa Session/CSRF — Verifikasi Signature MD5)
+Route::post('/api/payment/duitku/callback', [TransaksiController::class, 'duitkuCallback'])
+    ->withoutMiddleware([VerifyCsrfToken::class])
+    ->name('api.payment.duitku-callback');
+
+// Endpoint Inquiry VA/QRIS & Cek Status Transaksi Duitku (Bisa dipanggil Kasir, Admin, maupun Member)
+Route::middleware(['auth', 'role:admin,kasir,pelanggan'])->group(function () {
+    Route::post('/api/payment/duitku-qris', [TransaksiController::class, 'createQris'])->name('api.payment.duitku-qris');
+    Route::post('/api/payment/duitku/check-status', [TransaksiController::class, 'checkDuitkuStatus'])->name('api.payment.duitku-check-status');
+});
+
+// Webhook Callback Resmi Duitku (Tanpa Session/CSRF — Verifikasi Signature MD5)
+Route::post('/api/payment/duitku/callback', [TransaksiController::class, 'duitkuCallback'])
+    ->withoutMiddleware([VerifyCsrfToken::class])
+    ->name('api.payment.duitku-callback');
+
+// Cek Status Transaksi Duitku (Bisa dipanggil Kasir, Admin, maupun Member)
+Route::middleware(['auth', 'role:admin,kasir,pelanggan'])->group(function () {
+    Route::post('/api/payment/duitku/check-status', [TransaksiController::class, 'checkDuitkuStatus'])->name('api.payment.duitku-check-status');
 });
 
 // 3. Grup Khusus Owner / Manajer (Dashboard Eksekutif Read-Only)

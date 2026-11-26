@@ -35,4 +35,11 @@ return [
         ],
     ],
 
+    'duitku' => [
+        'merchant_code' => env('DUITKU_MERCHANT_CODE', ''),
+        'api_key' => env('DUITKU_API_KEY', ''),
+        'sandbox' => filter_var(env('DUITKU_SANDBOX', true), FILTER_VALIDATE_BOOLEAN),
+        'default_method' => env('DUITKU_PAYMENT_METHOD', 'SP'),
+    ],
+
 ];

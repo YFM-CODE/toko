@@ -469,17 +469,18 @@ test('kasir can process payment gateway via cpm barcode scan and qris mpm', func
         ->and($trxCpm->nominal_bayar)->toBe(15000.0)
         ->and($trxCpm->kembalian)->toBe(0.0);
 
-    // 2. Endpoint pembuatan QRIS Dinamis (Xendit / EMVCo Bank BRI)
-    $qrisInit = $this->actingAs($kasir)->postJson('/api/payment/xendit-qris', [
+    // 2. Endpoint pembuatan QRIS Dinamis Duitku Sandbox (atau fallback EMVCo)
+    $qrisInit = $this->actingAs($kasir)->postJson('/api/payment/duitku-qris', [
         'kode_transaksi' => 'TRX-202611-0099',
         'amount' => 10000,
+        'payment_method' => 'SP',
     ]);
     $qrisInit->assertOk()->assertJsonPath('ok', true);
 
     // 3. QRIS Dinamis Toko (MPM)
     $mpmResponse = $this->actingAs($kasir)->postJson('/api/transaksi', [
         'metode_pembayaran' => 'QRIS_MPM',
-        'payment_channel' => 'QRIS XENDIT / BANK BRI',
+        'payment_channel' => 'QRIS DUITKU SANDBOX',
         'payment_token' => 'QRIS:TRX-002:10000',
         'items' => [
             ['id_produk' => $produk->id_produk, 'jumlah' => 2],
@@ -489,8 +490,8 @@ test('kasir can process payment gateway via cpm barcode scan and qris mpm', func
     $mpmResponse->assertCreated();
     $trxMpm = Transaksi::latest('id_transaksi')->first();
     expect($trxMpm->metode_pembayaran)->toBe('QRIS_MPM')
-        ->and($trxMpm->payment_channel)->toBe('QRIS XENDIT / BANK BRI')
-        ->and($trxMpm->payment_ref)->toStartWith('BRI-');
+        ->and($trxMpm->payment_channel)->toBe('QRIS DUITKU SANDBOX')
+        ->and($trxMpm->payment_ref)->toStartWith('QRIS-');
 });
 
 test('cashier shift reports are strictly isolated per kasir while admin can filter per kasir', function () {
